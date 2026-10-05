@@ -1,4 +1,4 @@
-"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定、历史判定核对报表与灰度自动熔断。"""
+"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定（单笔与批量）、历史判定核对报表与灰度自动熔断。"""
 from __future__ import annotations
 
 import sqlite3
@@ -10,6 +10,7 @@ from . import db, preview, reporting, store
 from .models import (
     CircuitBreakerUpdate,
     DeliverRequest,
+    DeliveryBatchSubmit,
     DeliverySubmit,
     DraftChangesRequest,
     DraftUpdate,
@@ -508,6 +509,122 @@ def submit_delivery(body: DeliverySubmit) -> dict:
     return _decision_doc(decision)
 
 
+# ---------- 批量幂等投递判定（一次提交多笔：整批校验、同事务写入、逐项判定） ----------
+
+def _decision_detail_doc(decision: dict) -> dict:
+    """已持久化判定的完整视图（含状态与原错误详情）：批量响应与 GET /deliveries/{id} 共用。"""
+    return {
+        "delivery_id": decision["delivery_id"],
+        "address": decision["address"],
+        "status": decision["status"],
+        "policy_revision": decision["policy_revision"],
+        "baseline_version": decision["baseline_version"],
+        "candidate_version": decision["candidate_version"],
+        "candidate_percent": decision["candidate_percent"],
+        "selection": decision["selection"],
+        "version": decision["version"],
+        "endpoints": decision["endpoints"],
+        "error": decision["error"],
+        "created_at": decision["created_at"],
+    }
+
+
+@app.post("/deliveries/batch")
+def submit_delivery_batch(body: DeliveryBatchSubmit) -> dict:
+    """一次提交多笔投递判定（1–100 笔），返回与输入顺序一致的逐项判定。
+
+    整批先校验，任一不满足即整批拒绝且不写入任何判定：无效地址（422）、
+    批内重复编号（422）、既有编号绑定其他规范化地址（409）、
+    尚无默认策略且存在新编号（409）。
+    已有同编号同地址的判定原样重放；其余项目在同一事务中共用受理时的策略
+    修订号与比例，分别稳定分桶、解析并持久化（路由失败仍作为判定保存）。
+    新判定全部写入后仅评估一次该修订号的候选侧熔断：触发只影响后续请求，
+    本批仍返回已持久化的原判定；重放不重复计数。
+    """
+    normalized: list[tuple[str, str]] = []
+    for item in body.items:
+        address = item.address.strip().lower()
+        if not is_valid_address(address):  # 无效地址：整批拒绝，任何编号都不写入
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_address", "delivery_id": item.delivery_id,
+                        "message": f"invalid address: {item.address!r}"},
+            )
+        normalized.append((item.delivery_id, address))
+    seen_ids: set[str] = set()
+    for delivery_id, _ in normalized:
+        if delivery_id in seen_ids:  # 批内重复编号：整批拒绝
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "duplicate_delivery_id", "delivery_id": delivery_id,
+                        "message": f"duplicate delivery id in batch: {delivery_id!r}"},
+            )
+        seen_ids.add(delivery_id)
+    try:
+        with db.transaction() as conn:
+            existing = store.get_decisions(conn, [d for d, _ in normalized])
+            conflicts = sorted(
+                d for d, address in normalized
+                if d in existing and existing[d]["address"] != address
+            )
+            if conflicts:  # 既有编号绑定其他规范化地址：整批拒绝，原判定不改写
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "delivery_id_conflict", "conflict_ids": conflicts,
+                            "message": f"{len(conflicts)} delivery id(s) already submitted with a different address"},
+                )
+            new_items = [(d, a) for d, a in normalized if d not in existing]
+            policy = None
+            if new_items:
+                policy = store.get_policy(conn)
+                if policy is None:  # 回滚：未配置策略且存在新编号 → 整批拒绝，不占用编号
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"error": "policy_not_configured",
+                                "message": "no delivery policy configured; specify an explicit version via /resolve"},
+                    )
+            decisions = dict(existing)
+            rulesets: dict[int, RuleSet | None] = {}
+            for delivery_id, address in new_items:
+                chosen = select_version(address, policy["candidate_percent"])
+                version = policy["baseline_version"] if chosen == "baseline" else policy["candidate_version"]
+                if version not in rulesets:
+                    rulesets[version] = store.load_ruleset(conn, version)
+                ruleset = rulesets[version]
+                if ruleset is None:  # 防御：策略引用的版本必然已发布且不可变
+                    raise HTTPException(status_code=404, detail={"error": "version_not_found", "version": version})
+                try:
+                    endpoints = resolve(address, ruleset)
+                except ResolutionError as exc:  # 选中版本失败：本项失败并持久化，不切换版本
+                    detail = exc.detail()
+                    detail.update({
+                        "delivery_id": delivery_id,
+                        "policy_revision": policy["revision"],
+                        "version": version,
+                        "selection": chosen,
+                    })
+                    decisions[delivery_id] = store.save_decision(
+                        conn, delivery_id=delivery_id, address=address, policy=policy,
+                        selection=chosen, version=version, status="failed", endpoints=None, error=detail,
+                    )
+                else:
+                    endpoint_docs = [
+                        {"mailbox": mailbox, "paths": sorted(paths)}
+                        for mailbox, paths in sorted(endpoints.items())
+                    ]
+                    decisions[delivery_id] = store.save_decision(
+                        conn, delivery_id=delivery_id, address=address, policy=policy,
+                        selection=chosen, version=version, status="ok", endpoints=endpoint_docs, error=None,
+                    )
+            # 新判定全部写入后仅评估一次该修订号的候选侧熔断（重放不进入统计）；
+            # 触发只影响后续请求，本批响应仍为上面已持久化的原判定。
+            if new_items:
+                store.maybe_trigger_circuit_breaker(conn, policy)
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return {"items": [_decision_detail_doc(decisions[d]) for d, _ in normalized]}
+
+
 # ---------- 历史投递判定核对报表（时间窗 + 分组计数 + 游标分页） ----------
 
 _REPORT_ITEM_FIELDS = (
@@ -595,17 +712,4 @@ def get_delivery(delivery_id: str) -> dict:
         decision = store.get_decision(conn, delivery_id)
     if decision is None:
         raise HTTPException(status_code=404, detail={"error": "delivery_not_found", "delivery_id": delivery_id})
-    return {
-        "delivery_id": decision["delivery_id"],
-        "address": decision["address"],
-        "status": decision["status"],
-        "policy_revision": decision["policy_revision"],
-        "baseline_version": decision["baseline_version"],
-        "candidate_version": decision["candidate_version"],
-        "candidate_percent": decision["candidate_percent"],
-        "selection": decision["selection"],
-        "version": decision["version"],
-        "endpoints": decision["endpoints"],
-        "error": decision["error"],
-        "created_at": decision["created_at"],
-    }
+    return _decision_detail_doc(decision)

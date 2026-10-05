@@ -42,6 +42,13 @@
   相同编号 + 相同规范化地址的并发或后续请求**原样返回首次判定（含原错误状态）**，即使策略随后改变；
   编号相同而地址不同返回 409；**无效地址或未配置策略不占用编号**。
   `GET /deliveries/{id}` 可随时查询已持久化的判定。
+- **批量投递判定**：`POST /deliveries/batch` 一次提交 **1～100 笔**投递编号 + 收件地址，
+  返回**与输入顺序一致**的逐项判定（成功含终点路径，路由失败含原错误详情及状态）。
+  整批先校验——**无效地址、批内重复编号、既有编号绑定其他规范化地址、尚无默认策略且存在新编号**，
+  任一命中即整批拒绝且不写入任何判定；已有同编号同地址的判定原样重放，
+  其余项目在**同一事务**中共用受理时的策略修订号与比例，分别稳定分桶、解析并持久化
+  （路由失败仍作为判定保存）；新判定全部写入后**仅评估一次**该修订号的候选侧熔断，
+  触发只影响后续请求，重放不重复计数。
 - **历史投递判定核对报表**：`GET /deliveries/report` 按**带时区的起止时刻（左闭右开）与可选策略
   修订号**筛选已持久化的判定，返回按**选中版本 × 分流侧（基线/候选）× 结果（成功或失败原因）**
   分组的数量，并分页列出投递编号、规范化地址、策略修订号、选中版本、分流侧与状态或错误类型；
@@ -113,6 +120,7 @@ pytest tests/ -q                                   # 运行测试
 | GET  | `/policy/circuit-breaker` | 查询当前熔断设置与全部熔断记录     |
 | POST | `/deliver`        | 默认投递：按策略对收件地址稳定分桶解析 |
 | POST | `/deliveries`     | 幂等投递：投递编号 + 地址，首次判定持久化、重试原样返回 |
+| POST | `/deliveries/batch` | 批量幂等投递：一次 1–100 笔，整批校验、逐项判定     |
 | GET  | `/deliveries/report` | 历史判定核对报表：时间窗 + 分组计数 + 游标分页     |
 | GET  | `/deliveries/{id}` | 按投递编号查询已持久化的判定（含失败） |
 
@@ -501,6 +509,67 @@ curl http://localhost:8000/deliveries/msg-2026-10-04-0001
 > 既有 `/deliver`、`/resolve` 的请求、响应与错误约定完全不变：`/deliver` 仍只做即时分桶解析，
 > 不产生持久化判定；需要强制指定版本复现时继续使用 `/resolve`。
 
+### 10.1 批量提交投递判定（POST /deliveries/batch）
+
+投递系统一次提交多笔收件判定：请求体为 `{"items": [...]}`，每项与单笔接口相同
+（`delivery_id` + `address`），**单批 1～100 笔**；响应为 `{"items": [...]}`，
+**与输入顺序一致**，每项即一份完整判定（形状同 `GET /deliveries/{id}`）：
+成功 `"status": "ok"` 含 `endpoints` 终点路径，路由失败 `"status": "failed"` 含
+`error` 原错误详情（`rejected` / `no_route` / `cycle` 及 `delivery_id`、`policy_revision`、
+`version`、`selection`）。逐项成败互不影响，整批统一返回 `200`。
+
+```bash
+curl -X POST http://localhost:8000/deliveries/batch -H 'Content-Type: application/json' -d '{
+  "items": [
+    {"delivery_id": "msg-2026-10-05-0001", "address": "boss@corp.example.com"},
+    {"delivery_id": "msg-2026-10-05-0002", "address": "blocked@corp.example.com"},
+    {"delivery_id": "msg-2026-10-05-0003", "address": "nobody@corp.example.com"}
+  ]}'
+```
+
+```json
+{
+  "items": [
+    {"delivery_id": "msg-2026-10-05-0001", "address": "boss@corp.example.com", "status": "ok",
+     "policy_revision": 1, "baseline_version": 1, "candidate_version": 2, "candidate_percent": 20,
+     "selection": "candidate", "version": 2,
+     "endpoints": [{"mailbox": "alice@mail.example.com", "paths": [["boss@corp.example.com", "alice@mail.example.com"]]}],
+     "error": null, "created_at": "2026-10-05T01:16:03+00:00"},
+    {"delivery_id": "msg-2026-10-05-0002", "address": "blocked@corp.example.com", "status": "failed",
+     "policy_revision": 1, "baseline_version": 1, "candidate_version": 2, "candidate_percent": 20,
+     "selection": "candidate", "version": 2, "endpoints": null,
+     "error": {"error": "rejected", "message": "blocked@corp.example.com rejected by rule",
+               "address": "blocked@corp.example.com", "chain": ["blocked@corp.example.com"],
+               "delivery_id": "msg-2026-10-05-0002", "policy_revision": 1, "version": 2, "selection": "candidate"},
+     "created_at": "2026-10-05T01:16:03+00:00"}
+  ]
+}
+```
+
+**整批先校验**（任一命中即整批拒绝，**不写入任何判定**，修正后可整体重提）：
+
+| 场景 | 响应 |
+| ---- | ---- |
+| 任一项地址无效 | `422 {"error": "invalid_address", "delivery_id": ...}` |
+| 批内重复投递编号（即使地址相同） | `422 {"error": "duplicate_delivery_id", "delivery_id": ...}` |
+| 既有编号绑定其他规范化地址 | `409 {"error": "delivery_id_conflict", "conflict_ids": [...]}` |
+| 尚无默认策略且批内存在新编号 | `409 {"error": "policy_not_configured", ...}` |
+| 空批、超过 100 笔、缺字段、空编号 | `422`（请求体校验） |
+
+**受理与重放语义**（与单笔接口一致，且两个接口的判定互通）：
+
+- 批内**已有同编号同地址**的判定**原样重放**（含原错误详情与受理时的策略快照），
+  即使策略随后改变；全部是重放时不需要默认策略。
+- **新编号**项目在**同一事务**中共用受理时的策略修订号与比例，分别按自身规范化地址
+  稳定分桶、解析并持久化；路由失败仍作为判定保存，整批一次提交。
+- 新判定全部写入后**仅评估一次**该策略修订号的候选侧熔断（同 `POST /deliveries` 的
+  统计口径）：触发只影响后续请求，本批响应仍为已持久化的原判定；重放不重复计数。
+- 整批重提（超时重试）是安全的：已受理的编号重放、未受理的编号按同一规则判定，
+  响应与首次逐字段相同。
+
+> 单笔接口 `POST /deliveries` 的请求、响应及幂等约定完全不变；批量接口只是
+> 在同一事务里对多笔应用同一套判定规则。
+
 ## 灰度自动熔断：候选侧失败率达阈值自动回落基线
 
 灰度期间若候选版本出现异常（拒收 / 无路由 / 成环增多），可以让服务按**候选侧投递失败率**
@@ -681,7 +750,7 @@ app/
   reporting.py # 核对报表：带时区时间窗（左闭右开）校验、页大小校验、翻页游标编解码
   models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组）
   store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定、核对报表与灰度熔断的持久化与查询
-  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/report 等）
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 按键合并与修订快照 + 核对报表 + 灰度自动熔断
+  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/batch、/deliveries/report 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定（单笔与批量）+ 按键合并与修订快照 + 核对报表 + 灰度自动熔断
 Dockerfile / docker-compose.yml
 ```

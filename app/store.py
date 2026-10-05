@@ -484,20 +484,38 @@ def maybe_trigger_circuit_breaker(conn: sqlite3.Connection, policy: dict) -> dic
 
 # ---------- 幂等投递判定（投递编号 → 首次判定，永久可查、原样重放） ----------
 
-def get_decision(conn: sqlite3.Connection, delivery_id: str) -> dict | None:
-    """按投递编号读取已持久化的判定；不存在返回 None。JSON 字段在此还原。"""
-    row = conn.execute(
-        "SELECT delivery_id, address, policy_revision, baseline_version, candidate_version, "
-        "candidate_percent, selection, version, status, endpoints, error, created_at "
-        "FROM delivery_decisions WHERE delivery_id = ?",
-        (delivery_id,),
-    ).fetchone()
-    if row is None:
-        return None
+_DECISION_COLUMNS = (
+    "delivery_id, address, policy_revision, baseline_version, candidate_version, "
+    "candidate_percent, selection, version, status, endpoints, error, created_at"
+)
+
+
+def _row_to_decision(row: sqlite3.Row) -> dict:
     decision = dict(row)
     decision["endpoints"] = json.loads(decision["endpoints"]) if decision["endpoints"] is not None else None
     decision["error"] = json.loads(decision["error"]) if decision["error"] is not None else None
     return decision
+
+
+def get_decision(conn: sqlite3.Connection, delivery_id: str) -> dict | None:
+    """按投递编号读取已持久化的判定；不存在返回 None。JSON 字段在此还原。"""
+    row = conn.execute(
+        f"SELECT {_DECISION_COLUMNS} FROM delivery_decisions WHERE delivery_id = ?",
+        (delivery_id,),
+    ).fetchone()
+    return _row_to_decision(row) if row is not None else None
+
+
+def get_decisions(conn: sqlite3.Connection, delivery_ids: list[str]) -> dict[str, dict]:
+    """按一组投递编号批量读取已持久化的判定，返回 {delivery_id: decision}（未知编号不含在内）。"""
+    if not delivery_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in delivery_ids)
+    rows = conn.execute(
+        f"SELECT {_DECISION_COLUMNS} FROM delivery_decisions WHERE delivery_id IN ({placeholders})",
+        delivery_ids,
+    ).fetchall()
+    return {row["delivery_id"]: _row_to_decision(row) for row in rows}
 
 
 def save_decision(

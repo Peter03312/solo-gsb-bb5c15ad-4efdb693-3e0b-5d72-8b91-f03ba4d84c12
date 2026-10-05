@@ -87,6 +87,17 @@ class DeliverySubmit(BaseModel):
     address: str
 
 
+class DeliveryBatchItem(BaseModel):
+    delivery_id: str = Field(min_length=1, max_length=200, description="调用方唯一投递编号")
+    address: str
+
+
+class DeliveryBatchSubmit(BaseModel):
+    items: list[DeliveryBatchItem] = Field(
+        min_length=1, max_length=100, description="一批投递编号 + 收件地址（1–100 笔）"
+    )
+
+
 class ValidationFailure(Exception):
     """编辑期校验失败，message 直接作为 4xx 响应。"""
 
